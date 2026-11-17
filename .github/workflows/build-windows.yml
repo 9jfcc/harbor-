@@ -1,0 +1,72 @@
+name: Build Custom Harbor (Windows)
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+env:
+  NODE_OPTIONS: --max-old-space-size=6144
+  HARBOR_CAPSTAN_OPTIONAL: "1"
+
+jobs:
+  build-windows:
+    name: Windows (x86_64-pc-windows-msvc)
+    runs-on: windows-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: |
+            harbor-core
+            src-tauri
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+
+      - name: Set up Pokémon engine SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.401"
+
+      - name: Build Pokémon engine
+        run: node tools/pokemon-engine/build.mjs --fetch-source "${{ runner.temp }}/harbor-pokemon-source" --output src-tauri/resources/pokemon-engine --artifacts "${{ runner.temp }}/harbor-pokemon-build"
+
+      - name: Install JS deps
+        run: pnpm install --frozen-lockfile
+
+      - name: Fetch libmpv
+        run: pnpm run setup:libmpv
+
+      - name: Stage VC++ runtime
+        run: pnpm run setup:vcruntime
+
+      - name: Fetch mpv
+        run: pnpm run setup:mpv
+
+      - name: Fetch external binaries
+        run: pnpm run setup:binaries
+
+      - name: Build Windows binary and installer
+        run: pnpm tauri build --target x86_64-pc-windows-msvc --bundles nsis
+
+      - name: Upload Harbor Windows Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Harbor-Custom-Windows
+          path: |
+            src-tauri/target/x86_64-pc-windows-msvc/release/harbor.exe
+            src-tauri/target/x86_64-pc-windows-msvc/release/bundle/nsis/*.exe

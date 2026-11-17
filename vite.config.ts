@@ -1,0 +1,365 @@
+import { readFileSync } from "node:fs";
+import { execSync } from "node:child_process";
+import { defineConfig, type ViteDevServer, type HttpProxy } from "vite";
+import react from "@vitejs/plugin-react";
+import tailwindcss from "@tailwindcss/vite";
+import pkg from "./package.json" with { type: "json" };
+// Shared with safe-fetch.ts, which rewrites these hosts to /api-proxy/<host> on localhost.
+import DEV_PROXY_HOST_LIST from "./src/lib/dev-proxy-hosts.json" with { type: "json" };
+
+declare const process: { env: Record<string, string | undefined> };
+
+// Folders (trailing /) and files the React Compiler memoizes; see docs/ARCHITECTURE-FOLLOWUPS.md.
+const REACT_COMPILER_DIRS = ["/src/components/", "/src/chrome/", "/src/views/"];
+// oxlint's React Compiler rules that `vp check` enforces on those folders.
+const REACT_COMPILER_RULES = [
+  "error-boundaries",
+  "globals",
+  "immutability",
+  "preserve-manual-memoization",
+  "purity",
+  "refs",
+  "set-state-in-render",
+  "static-components",
+  "use-memo",
+  "void-use-memo",
+];
+// Default react-plugin warnings left off: too many existing call sites (check:react-compiler covers memo deps).
+const REACT_COMPILER_RULES_OFF = ["incompatible-library", "set-state-in-effect"];
+// Folders already free of setState in effect bodies, where `vp check` enforces set-state-in-effect.
+const SET_STATE_IN_EFFECT_DIRS = [
+  "/src/chrome/",
+  "/src/components/age-gate-modal.tsx",
+  "/src/components/anime-hero-art-fallback.ts",
+  "/src/components/anime-hero.tsx",
+  "/src/components/anime-hero/",
+  "/src/components/avatar-image.tsx",
+  "/src/components/avatar-picker/",
+  "/src/components/award-detail-modal.tsx",
+  "/src/components/brand-tiles.tsx",
+  "/src/components/cinema-hero.tsx",
+  "/src/components/community-addons-rail.tsx",
+  "/src/components/continue-card.tsx",
+  "/src/components/critics-pick.tsx",
+  "/src/components/critics-pick/",
+  "/src/components/curfew-guard.tsx",
+  "/src/components/diagnostics/",
+  "/src/components/dropdown.tsx",
+  "/src/components/edit-folder-images-modal.tsx",
+  "/src/components/featured-banner.tsx",
+  "/src/components/featured-banner/",
+  "/src/components/hero-carousel.tsx",
+  "/src/components/hero.tsx",
+  "/src/components/hover-preview.tsx",
+  "/src/components/hover-preview/",
+  "/src/components/hover-tooltip.tsx",
+  "/src/components/icons/",
+  "/src/components/lazy-mount.tsx",
+  "/src/components/mal/",
+  "/src/components/modal-shell.tsx",
+  "/src/components/notification-center/",
+  "/src/components/peek-hero.tsx",
+  "/src/components/person-hover-card.tsx",
+  "/src/components/pick-card.tsx",
+  "/src/components/pick-card/",
+  "/src/components/play-on-device-card.tsx",
+  "/src/components/play-on-modal.tsx",
+  "/src/components/play-on-pair.tsx",
+  "/src/components/pop-icon.tsx",
+  "/src/components/poster.tsx",
+  "/src/components/profile-picker/",
+  "/src/components/rank-modal-shell.tsx",
+  "/src/components/screensaver/",
+  "/src/components/search/",
+  "/src/components/song-id-toast.tsx",
+  "/src/components/together-chat-toast.tsx",
+  "/src/components/together-host-leaving-prompt.tsx",
+  "/src/components/together-invite-toast.tsx",
+  "/src/components/together-modal.tsx",
+  "/src/components/together-modal/",
+  "/src/components/top-people-cta.tsx",
+  "/src/components/top-rank-modal.tsx",
+  "/src/components/tv-card.tsx",
+  "/src/components/update/",
+  "/src/components/voyage/",
+  "/src/views/account/",
+  "/src/views/addon-collection.tsx",
+  "/src/views/addons.tsx",
+  "/src/views/addons/",
+  "/src/views/anime-award.tsx",
+  "/src/views/anime.tsx",
+  "/src/views/anime/",
+  "/src/views/award.tsx",
+  "/src/views/award/",
+  "/src/views/brands.tsx",
+  "/src/views/calendar.tsx",
+  "/src/views/calendar/",
+  "/src/views/captions-app.tsx",
+  "/src/views/catalogs.tsx",
+  "/src/views/catalogs/",
+  "/src/views/collection.tsx",
+  "/src/views/collections.tsx",
+  "/src/views/collections/",
+  "/src/views/curated-list.tsx",
+  "/src/views/curated-list/",
+  "/src/views/discover.tsx",
+  "/src/views/discover/",
+  "/src/views/dj/",
+  "/src/views/downloads.tsx",
+  "/src/views/downloads/",
+  "/src/views/ebook.tsx",
+  "/src/views/ebook/",
+  "/src/views/episode-detail.tsx",
+  "/src/views/feed.tsx",
+  "/src/views/feed/",
+  "/src/views/filter.tsx",
+  "/src/views/filter/",
+  "/src/views/group.tsx",
+  "/src/views/group/",
+  "/src/views/groups.tsx",
+  "/src/views/groups/",
+  "/src/views/home.tsx",
+  "/src/views/home/",
+  "/src/views/kids-detail.tsx",
+  "/src/views/kids-detail/",
+  "/src/views/kids.tsx",
+  "/src/views/kids/",
+  "/src/views/library.tsx",
+  "/src/views/library/",
+  "/src/views/live.tsx",
+  "/src/views/live/",
+  "/src/views/movies.tsx",
+  "/src/views/movies/",
+  "/src/views/multiview.tsx",
+  "/src/views/multiview/",
+  "/src/views/people.tsx",
+  "/src/views/people/",
+  "/src/views/person.tsx",
+  "/src/views/person/",
+  "/src/views/playlist-vod.tsx",
+  "/src/views/playlist-vod/",
+  "/src/views/plugins.tsx",
+  "/src/views/plugins/",
+  "/src/views/profile/",
+  "/src/views/queue.tsx",
+  "/src/views/ratings/",
+  "/src/views/remote-app.tsx",
+  "/src/views/shared-list.tsx",
+  "/src/views/shared-list/",
+  "/src/views/shows.tsx",
+  "/src/views/shows/",
+  "/src/views/spooktober/",
+  "/src/views/video-pip.tsx",
+];
+// Babel runs only on these folders; every other file skips it and goes straight to esbuild.
+const compilesReact = (id: string) =>
+  REACT_COMPILER_DIRS.some((dir) => id.replace(/\\/g, "/").includes(dir));
+
+function silenceMediapipeSourcemap() {
+  return {
+    name: "silence-mediapipe-sourcemap",
+    enforce: "pre" as const,
+    load(id: string) {
+      const file = id.split("?")[0];
+      if (file.includes("@mediapipe") && file.endsWith(".mjs")) {
+        const code = readFileSync(file, "utf-8").replace(/\/\/#\s*sourceMappingURL=[^\n]*/g, "");
+        return { code, map: null };
+      }
+      return null;
+    },
+  };
+}
+
+function servePublicMediapipe() {
+  return {
+    name: "serve-public-mediapipe",
+    apply: "serve" as const,
+    configureServer(server: ViteDevServer) {
+      server.middlewares.use((req, res, next) => {
+        const path = (req.url ?? "").split("?")[0];
+        if (!path.startsWith("/mp-wasm/") || path.includes("..") || !path.endsWith(".js")) {
+          next();
+          return;
+        }
+        let body: Buffer;
+        try {
+          body = readFileSync(`${server.config.root}/public${path}`);
+        } catch {
+          next();
+          return;
+        }
+        res.setHeader("Content-Type", "text/javascript; charset=utf-8");
+        res.setHeader("Cache-Control", "no-cache");
+        res.end(body);
+      });
+    },
+  };
+}
+
+export default defineConfig(({ mode }) => {
+  const android = mode === "android" || process.env.HARBOR_TARGET === "android";
+  const devHost = process.env.TAURI_DEV_HOST;
+  return {
+    staged: { "*": "vp check --fix" },
+    // Rules of React on the compiled folders; which compiler rules stay off is in docs/ARCHITECTURE-FOLLOWUPS.md.
+    lint: {
+      overrides: [
+        {
+          files: REACT_COMPILER_DIRS.map((dir) => `${dir.slice(1)}**`),
+          plugins: ["react"],
+          rules: {
+            ...Object.fromEntries(REACT_COMPILER_RULES.map((rule) => [`react/${rule}`, "error"])),
+            ...Object.fromEntries(REACT_COMPILER_RULES_OFF.map((rule) => [`react/${rule}`, "off"])),
+            "react-hooks/exhaustive-deps": "off",
+          },
+        },
+        {
+          files: SET_STATE_IN_EFFECT_DIRS.map((dir) => `${dir.slice(1)}**`),
+          plugins: ["react"],
+          rules: { "react/set-state-in-effect": "error" },
+        },
+      ],
+    },
+    plugins: [
+      react({
+        babel: (id) =>
+          compilesReact(id)
+            ? { plugins: [["babel-plugin-react-compiler", { panicThreshold: "none" }]] }
+            : {},
+      }),
+      tailwindcss(),
+      silenceMediapipeSourcemap(),
+      servePublicMediapipe(),
+    ],
+    clearScreen: false,
+    define: {
+      __APP_VERSION__: JSON.stringify(pkg.version),
+      __IS_BETA_BUILD__: JSON.stringify(process.env.HARBOR_CHANNEL === "beta"),
+      __BUILD_ID__: JSON.stringify(
+        process.env.HARBOR_BUILD_ID ||
+          (() => {
+            try {
+              return execSync("git rev-parse --short HEAD").toString().trim();
+            } catch {
+              return "local";
+            }
+          })(),
+      ),
+      __BUILD_DATE__: JSON.stringify(new Date().toISOString().slice(0, 10)),
+    },
+    // Both entries ship. index-tv.html is what the TV window loads; index.html
+    // exists only so web_server.rs has a page to hand the phone for /remote,
+    // which the QR hand-off in onboarding depends on. Listing tv alone left the
+    // phone staring at "web assets are not available in this build".
+    // Vite 7 defaults to baseline-widely-available, a chrome107 floor. Android
+    // TV sticks and Fire TV ship a System WebView well below that, and the
+    // failure is a bare SyntaxError before React mounts, with no error surface
+    // on a device you cannot open devtools on. Pin a floor the hardware meets.
+    // This lowers syntax only; esbuild adds no API polyfills.
+    ...(android
+      ? {
+          build: {
+            target: "chrome87",
+            rollupOptions: { input: { tv: "index-tv.html", main: "index.html" } },
+          },
+        }
+      : {
+          build: { rollupOptions: { input: { main: "index.html", retro: "retro-player.html" } } },
+        }),
+    server: {
+      host: devHost || "127.0.0.1",
+      port: 1420,
+      strictPort: true,
+      ...(devHost ? { hmr: { protocol: "ws", host: devHost, port: 1421 } } : {}),
+      watch: {
+        ignored: [
+          "**/src-tauri/**",
+          "**/android-native/**",
+          "**/android/**",
+          "**/android-extension-compat/**",
+          "**/.gradle/**",
+          "**/target/**",
+          "**/work/**",
+          "**/scratchpad/**",
+          "**/.firecrawl/**",
+          "**/.diag/**",
+          "**/_private/**",
+          "**/harbor-install-recovery/**",
+        ],
+      },
+      proxy: Object.fromEntries(
+        DEV_PROXY_HOST_LIST.map((host) => [
+          `/api-proxy/${host}`,
+          {
+            target: `https://${host}`,
+            changeOrigin: true,
+            ...(["www.youtube.com", "kick.com", "prosettings.net"].includes(host)
+              ? {
+                  configure(proxy: HttpProxy.ProxyServer) {
+                    proxy.on("proxyReq", (request) => {
+                      // Public guide fetches are server-to-server, like native Harbor.
+                      // Local webview fetch metadata describes our proxy, not the source.
+                      for (const name of [
+                        "origin",
+                        "referer",
+                        "sec-fetch-site",
+                        "sec-fetch-mode",
+                        "sec-fetch-dest",
+                      ])
+                        request.removeHeader(name);
+                    });
+                  },
+                }
+              : {}),
+            ...(host === "steamcommunity.com"
+              ? {
+                  configure(proxy: HttpProxy.ProxyServer) {
+                    proxy.on("proxyRes", (response, request) => {
+                      // Keep canonical achievement redirects (440 → TF2) inside the dev proxy.
+                      if (
+                        !/^\/stats\/[^/]+\/achievements\/?(?:\?|$)/.test(request.url ?? "") ||
+                        !response.headers.location
+                      )
+                        return;
+                      try {
+                        const destination = new URL(
+                          response.headers.location,
+                          "https://steamcommunity.com",
+                        );
+                        if (
+                          destination.origin === "https://steamcommunity.com" &&
+                          /^\/stats\/[^/]+\/achievements\/?$/.test(destination.pathname)
+                        ) {
+                          response.headers.location = `/api-proxy/steamcommunity.com${destination.pathname}${destination.search}`;
+                        }
+                      } catch {
+                        /* Leave malformed or unrelated upstream redirects unchanged. */
+                      }
+                    });
+                  },
+                }
+              : {}),
+            rewrite: (path: string) => path.replace(`/api-proxy/${host}`, ""),
+          },
+        ]),
+      ),
+    },
+    resolve: {
+      alias: { "@": "/src" },
+    },
+    assetsInclude: ["**/*.onnx", "**/*.tflite"],
+    // JSON.parse beats an object literal at startup; named JSON imports are unsupported, use the default export.
+    json: { stringify: true },
+    optimizeDeps: {
+      // Scan only app entries, not the installer or local HTML previews.
+      entries: ["index.html", "index-tv.html"],
+      // Reached only from a lazy route's own lazy child, so the scanner does not find it from an
+      // entry. Discovered at runtime instead, it answers the first request with a 504 and a reload
+      // the error boundary swallows, which strands that route until the dep cache is rebuilt.
+      // react/compiler-runtime: plugin-react adds it only for a static babel object, not a function.
+      include: ["qrcode", "react/compiler-runtime"],
+      exclude: ["onnxruntime-web", "@mediapipe/tasks-vision"],
+    },
+    worker: { format: "es" },
+  };
+});

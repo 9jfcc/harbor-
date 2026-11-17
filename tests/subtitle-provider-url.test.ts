@@ -1,0 +1,197 @@
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import assert from "node:assert/strict";
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import { readFileSync } from "node:fs";
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import test from "node:test";
+import { deduplicateAndRankSubtitleResults } from "../src/lib/subtitles/search.ts";
+import * as providerUrl from "../src/lib/subtitles/provider-url.ts";
+import {
+  isPublicNetworkHost,
+  isSafeProviderSubtitleUrl,
+  SUBTITLE_PUBLIC_NETWORK_HEADER,
+} from "../src/lib/subtitles/provider-url.ts";
+import {
+  providerSubtitleDownloadHeaders,
+  subtitleTrackDownloadHeaders,
+} from "../src/lib/subtitles/provider-auth.ts";
+import type { SubResult } from "../src/lib/subtitles/types.ts";
+import { loadModule } from "./helpers/hook-harness.ts";
+import { html5BridgeHarness } from "./helpers/html5-bridge-harness.ts";
+import { mpvBridgeHarness } from "./helpers/mpv-bridge-harness.ts";
+
+test("provider subtitles accept only public HTTP(S) URLs", () => {
+  for (const value of [
+    "file:///tmp/private.srt",
+    "C:\\private.srt",
+    "\\\\server\\share\\private.srt",
+    "smb://server/share/private.srt",
+    "custom://player/private.srt",
+    "data:text/plain,secret",
+    "http://localhost/private.srt",
+    "http://127.0.0.1/private.srt",
+    "http://2130706433/private.srt",
+    "http://10.1.2.3/private.srt",
+    "http://100.64.0.1/private.srt",
+    "http://172.16.0.1/private.srt",
+    "http://192.168.1.2/private.srt",
+    "http://169.254.1.2/private.srt",
+    "http://[::1]/private.srt",
+    "http://[fe80::1]/private.srt",
+    "http://[fc00::1]/private.srt",
+    "http://[fec0::1]/private.srt",
+    "http://[2002:0a00:0001::1]/private.srt",
+    "https://user:password@example.com/private.srt",
+  ]) {
+    assert.equal(isSafeProviderSubtitleUrl(value), false, value);
+  }
+  assert.equal(isSafeProviderSubtitleUrl("https://cdn.example.com/subtitle.srt"), true);
+  assert.equal(isSafeProviderSubtitleUrl("http://1.1.1.1/subtitle.srt"), true);
+  assert.equal(isPublicNetworkHost("2606:4700:4700::1111"), true);
+});
+
+test("provider result aggregation drops unsafe URLs before ranking", () => {
+  const result = (id: string, url: string): SubResult => ({
+    id,
+    url,
+    lang: "en",
+    source: "addon",
+  });
+  assert.deepEqual(
+    deduplicateAndRankSubtitleResults(
+      [
+        result("file", "file:///tmp/private.srt"),
+        result("public", "https://cdn.example.com/a.srt"),
+      ],
+      ["en"],
+    ).map((item) => item.id),
+    ["public"],
+  );
+});
+
+function loadSafeFetch(isTauri: boolean) {
+  const invokes: Record<string, any>[] = [];
+  const webRequests: RequestInit[] = [];
+  const noop = () => {};
+  const api = loadModule(
+    "src/lib/safe-fetch.ts",
+    {
+      "@tauri-apps/api/core": {
+        invoke: async (_cmd: string, payload: { args: Record<string, any> }) => {
+          invokes.push(payload.args);
+          return { status: 200, ok: true, body: "", contentType: null };
+        },
+      },
+      "@tauri-apps/plugin-http": { fetch: async () => new Response("") },
+      "./privacy/blocklist": {
+        TrackerBlockedError: class extends Error {},
+        isBlockedUrl: () => false,
+        noteBlocked: noop,
+      },
+      "./fetch-bridge-stats": { bridgeOutcome: () => "ok", recordBridge: noop },
+      "./direct-host-policy": {
+        allowDirectHost: noop,
+        classifyDirectFailure: () => ({}),
+        clearDirectFailures: noop,
+        directHostFor: () => null,
+        noteDirectFailure: noop,
+      },
+      "./dev-proxy-hosts.json": { default: [] },
+      "./fetch-fallback-policy": {
+        hasSensitiveRequestHeaders: () => false,
+        shouldFallbackToPluginHttp: () => false,
+      },
+      "./local-network": { isLocalNetworkUrl: () => false },
+      "./subtitles/provider-url": providerUrl,
+    },
+    {
+      window: isTauri ? { __TAURI_INTERNALS__: {} } : { location: { hostname: "example.org" } },
+      fetch: async (_url: string, init: RequestInit) => (webRequests.push(init), new Response("")),
+    },
+  );
+  return { api, invokes, webRequests };
+}
+
+test("provider download policy is marked internally and pinned natively", async () => {
+  const headers = providerSubtitleDownloadHeaders(
+    undefined,
+    "https://cdn.example.com/subtitle.srt",
+  );
+  assert.deepEqual(headers, { [SUBTITLE_PUBLIC_NETWORK_HEADER]: "1" });
+
+  const app = loadSafeFetch(true);
+  await app.api.safeFetchBytes("https://cdn.example.com/subtitle.srt", { headers });
+  assert.equal(app.invokes[0].publicNetworkOnly, true);
+  assert.deepEqual(app.invokes[0].headers, {}, "the marker never reaches the network");
+  await assert.rejects(app.api.safeFetchBytes("http://192.168.1.2/subtitle.srt", { headers }));
+  assert.equal(app.invokes.length, 1);
+
+  const browser = loadSafeFetch(false);
+  await browser.api.safeFetchBytes("https://cdn.example.com/subtitle.srt", { headers });
+  const sent = new Headers(browser.webRequests[0].headers);
+  assert.equal(sent.has(SUBTITLE_PUBLIC_NETWORK_HEADER), false);
+
+  const nativeSource = readFileSync(
+    new URL("../src-tauri/src/http_fetch.rs", import.meta.url),
+    "utf8",
+  );
+  const guardSource = readFileSync(
+    new URL("../src-tauri/shared/src/net_guard.rs", import.meta.url),
+    "utf8",
+  );
+  assert.match(
+    nativeSource,
+    /hop_client\(&current_url, allow_local_network, public_network_only\)/,
+  );
+  assert.match(guardSource, /resolve_public_target\(url\)\.await\?/);
+  assert.match(guardSource, /resolve_to_addrs\(host, addresses\)/);
+});
+
+test("public-network policy applies only to provider-derived subtitle tracks", () => {
+  const lanUrl = "http://192.168.1.20/subtitle.srt";
+  assert.equal(subtitleTrackDownloadHeaders(undefined, lanUrl, false), undefined);
+  assert.deepEqual(subtitleTrackDownloadHeaders(undefined, lanUrl, true), {
+    [SUBTITLE_PUBLIC_NETWORK_HEADER]: "1",
+  });
+});
+
+const lanSub = "http://192.168.1.20/subtitle.srt";
+const trackCases = [
+  [{ provider: "addon" }, false],
+  [{ providerDerived: true }, false],
+  [{ provider: "addon", providerDerived: false }, true],
+  [undefined, true],
+] as const;
+
+test("player bridges allow explicitly trusted generated tracks without weakening provider checks", async () => {
+  for (const [metadata, accepted] of trackCases) {
+    const html5 = html5BridgeHarness({}, { safeProviderUrl: isSafeProviderSubtitleUrl });
+    await html5.bridge.load({ url: "https://media.test/a.mp4" });
+    const added = await html5.bridge.addSubtitle(lanSub, "en", "Sub", false, metadata as never);
+    assert.equal(added, accepted, `html5 ${JSON.stringify(metadata)}`);
+
+    const headerCalls: unknown[][] = [];
+    const mpv = mpvBridgeHarness(undefined, undefined, {
+      safeProviderUrl: isSafeProviderSubtitleUrl,
+      trackHeaders: (...args: unknown[]) => (headerCalls.push(args), undefined),
+    });
+    await mpv.bridge.load({ url: "fixture.mkv" });
+    const viaMpv = await mpv.bridge.addSubtitle(lanSub, "en", "Sub", false, metadata as never);
+    assert.equal(viaMpv, accepted, `mpv ${JSON.stringify(metadata)}`);
+    if (accepted) assert.deepEqual(headerCalls, [[undefined, lanSub, false]]);
+  }
+
+  const headerCalls: unknown[][] = [];
+  const mpv = mpvBridgeHarness(undefined, undefined, {
+    safeProviderUrl: isSafeProviderSubtitleUrl,
+    trackHeaders: (...args: unknown[]) => (headerCalls.push(args), undefined),
+  });
+  await mpv.bridge.load({ url: "fixture.mkv" });
+  const auth = { kind: "subdl-api-key", credentialId: "c1" };
+  const publicSub = "https://cdn.example.com/subtitle.srt";
+  await mpv.bridge.addSubtitle(publicSub, "en", "Sub", false, {
+    provider: "subdl",
+    downloadAuth: auth,
+  } as never);
+  assert.deepEqual(headerCalls, [[auth, publicSub, true]]);
+});

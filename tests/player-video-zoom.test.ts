@@ -1,0 +1,96 @@
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import assert from "node:assert/strict";
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import test from "node:test";
+import { hookHarness, loadModule } from "./helpers/hook-harness.ts";
+
+type Fill = { step: (delta: number) => void; cycle: () => void };
+
+// Runs useVideoFill once with plain refs and no effects; the zoom state lives in its refs.
+function videoFill() {
+  const zooms: number[] = [];
+  const flashes: Array<{ icon: string; value: string }> = [];
+  const exports = loadModule("src/views/player/hooks/use-video-fill.ts", {
+    react: { useRef: (current: unknown) => ({ current }), useEffect() {} },
+    "@/lib/i18n": { t: (s: string) => s },
+    "@/lib/settings": {
+      useSettingsSelector: (select: (s: unknown) => unknown) => select({ cropMode: "fit" }),
+      useSettingsUpdate: () => () => {},
+    },
+  }) as { useVideoFill?: (...args: unknown[]) => Fill; ZOOM_STEP?: number };
+  const bridge = {
+    setPanscan() {},
+    setAspectOverride() {},
+    setStretch() {},
+    setVideoZoom: (log2: number) => zooms.push(log2),
+  };
+  const flash = (f: { icon: string; value: string }) => flashes.push(f);
+  const fill = exports.useVideoFill!({ current: bridge }, "src", false, flash);
+  return { fill, zooms, flashes, step: exports.ZOOM_STEP! };
+}
+
+test("zoom can go below 1x, not only above it", () => {
+  const { fill, zooms, step } = videoFill();
+  for (let i = 0; i < 200; i += 1) fill.step(-step);
+  const min = zooms.at(-1)!;
+  assert.ok(min < 0, `zoom bottoms out at ${min}`);
+  for (let i = 0; i < 400; i += 1) fill.step(step);
+  assert.ok(zooms.at(-1)! > 0);
+});
+
+test("one step moves the picture by a couple of percent", () => {
+  const { step } = videoFill();
+  const percent = (Math.pow(2, step) - 1) * 100;
+  assert.ok(percent > 0.5 && percent < 3, `a step moves ${percent.toFixed(2)}%`);
+});
+
+test("steps accumulate without rounding drift", () => {
+  const { fill, zooms, step } = videoFill();
+  for (let i = 0; i < 20; i += 1) fill.step(step);
+  assert.equal(zooms.at(-1), Math.round(step * 20 * 1e6) / 1e6);
+});
+
+test("the fill for a 16:9 picture on a 21:9 screen is reachable", () => {
+  const { fill, zooms, step } = videoFill();
+  const needed = Math.log2(3440 / 1440 / (16 / 9));
+  let presses = 0;
+  while ((zooms.at(-1) ?? 0) < needed && presses < 30) {
+    fill.step(step);
+    presses += 1;
+  }
+  assert.ok(zooms.at(-1)! >= needed, `${presses} presses reach only ${zooms.at(-1)}`);
+});
+
+test("the readout appears when zoomed out, not only when zoomed in", () => {
+  const { fill, flashes, step } = videoFill();
+  fill.step(-step);
+  assert.equal(flashes.at(-1)?.icon, "zoom");
+  assert.equal(flashes.at(-1)?.value, `${Math.round(Math.pow(2, -step) * 100)}%`);
+  fill.step(step);
+  assert.equal(flashes.at(-1)?.icon, "aspect", "back at 1x shows the mode, not a 100% zoom");
+});
+
+test("the hotkeys use the shared step instead of their own number", () => {
+  // A step value no literal in the hook could match.
+  const shared = 0.0123;
+  let shortcuts: Record<string, any> = {};
+  const h = hookHarness("src/views/player/hooks/use-player-hotkeys.ts", "usePlayerHotkeys", {
+    "@/lib/i18n": { useT: () => (s: string) => s },
+    "./use-keyboard-shortcuts": {
+      useKeyboardShortcuts: (options: Record<string, any>) => {
+        shortcuts = options;
+        return { holdSpeedActive: false, subtitleOffsetSec: 0 };
+      },
+    },
+    "./use-video-fill": { ZOOM_STEP: shared },
+  });
+  const steps: number[] = [];
+  h.render({
+    liveOverlay: { isLive: false },
+    sleep: { mode: { kind: "off" } },
+    videoFill: { step: (delta: number) => steps.push(delta), cycle() {} },
+  });
+  shortcuts.onPanscanUp();
+  shortcuts.onPanscanDown();
+  assert.deepEqual(steps, [shared, -shared]);
+});

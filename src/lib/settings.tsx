@@ -1,0 +1,757 @@
+import { activeSettingsSource } from "@/lib/profile-roster";
+import {
+  createContext,
+  useCallback,
+  useContext,
+  useEffect,
+  useLayoutEffect,
+  useMemo,
+  useRef,
+  useState,
+  useSyncExternalStore,
+  type ReactNode,
+} from "react";
+import { applyTheme, isKnownPreset, nextColorTheme } from "@/lib/theme";
+import { applyAppIcon } from "@/lib/app-icon";
+import { getCustomThemes, subscribeCustomThemes } from "@/lib/custom-themes";
+import { loadBgImage, saveBgImage } from "@/lib/theme-storage";
+import { effectiveTmdbLanguage, setTmdbLanguage } from "@/lib/providers/tmdb/tmdb-client";
+import { setPosterBaseUrl } from "@/lib/providers/rpdb";
+import { setMdblistBatchKey } from "@/lib/providers/mdblist-batch";
+import { setTvdbKey } from "@/lib/providers/tvdb";
+import { setTraktCredentials } from "@/lib/trakt/credentials";
+import { setMalClientId } from "@/lib/mal/credentials";
+import { setIgdbCredentials } from "@/lib/games/igdb-client";
+import { setUiLanguage } from "@/lib/i18n";
+import { makeSafeTauriUnlisten } from "@/lib/tauri-unlisten";
+import { STORAGE_KEY } from "./settings/defaults";
+import { readSettingsFile, writeSettingsFile } from "./settings/file-store";
+import { torrentEngineSetEnabled } from "./torrent/local-engine";
+import { loadFontData, saveFontData } from "./font-storage";
+import {
+  fontFamilyAfterRemoval,
+  migrateInlineFonts,
+  stripMovedFonts,
+} from "./settings/custom-fonts";
+import { isRemovedBuiltinAvatar } from "./avatars/catalog";
+import {
+  forkToProfile,
+  loadEffective,
+  persistEffective,
+  readSettingsSecrets,
+  seedSharedFromLegacy,
+  sourceKeyFor,
+  writeSettingsSecrets,
+} from "./settings/profile-store";
+import { changedSecrets, mergeSecrets } from "./settings/secret-fields";
+import { setTmdbKey } from "./settings/tmdb-key";
+import {
+  flushSecrets,
+  getSecretsWriteStatus,
+  subscribeSecretsSettled,
+  subscribeSecretsWriteStatus,
+} from "./secret-store";
+import type { Settings, StreamingService } from "./settings/types";
+import { markSectionDirty } from "./profile-sync/scheduler";
+import { configureLayoutStore } from "./layout-sync/store";
+import { SYNCED_SETTINGS_FIELDS } from "./layout-sync/sections";
+import {
+  createSelectionReader,
+  createSettingsStore,
+  type SettingsStore,
+} from "./settings/selector-store";
+import { createSettingsWriter } from "./settings/settings-writer";
+import { applySettingsPatch, changedSettingsKeys } from "./settings/patch";
+
+export type {
+  ContentCategory,
+  ContentFilters,
+  Settings,
+  StreamingService,
+  StreamPriorityEntry,
+  WebhookTrigger,
+} from "./settings/types";
+
+type SettingsValue = {
+  settings: Settings;
+  torrentEnginePolicyPending: boolean;
+  torrentEnginePolicyError: boolean;
+  update: (patch: Partial<Settings>) => void;
+  toggleStreaming: (s: StreamingService) => void;
+  switchProfile: (profileId: string, linked: boolean) => void;
+  setSettingsLinked: (linked: boolean) => void;
+};
+
+type SettingsSource = { profileId: string; linked: boolean };
+
+function readActiveSource(): SettingsSource {
+  return activeSettingsSource();
+}
+
+const Ctx = createContext<SettingsValue | null>(null);
+const StoreCtx = createContext<SettingsStore | null>(null);
+const UpdateCtx = createContext<SettingsValue["update"] | null>(null);
+type SettingsActions = Pick<
+  SettingsValue,
+  "update" | "toggleStreaming" | "switchProfile" | "setSettingsLinked"
+>;
+const ActionsCtx = createContext<SettingsActions | null>(null);
+
+// Module setters for provider keys; children read them during render and in effects, so the first call precedes them.
+type ProviderKeys = Pick<
+  Settings,
+  | "tmdbKey"
+  | "tvdbKey"
+  | "traktClientId"
+  | "traktClientSecret"
+  | "malClientId"
+  | "igdbClientId"
+  | "igdbClientSecret"
+>;
+
+function applyProviderKeys(s: ProviderKeys): void {
+  setTmdbKey(s.tmdbKey ?? "");
+  setTvdbKey(s.tvdbKey ?? "");
+  setTraktCredentials(s.traktClientId ?? "", s.traktClientSecret ?? "");
+  setMalClientId(s.malClientId ?? "");
+  setIgdbCredentials(s.igdbClientId ?? "", s.igdbClientSecret ?? "");
+}
+
+const PERSIST_BURST_MS = 150;
+
+export function SettingsProvider({
+  children,
+  syncTorrentEnginePolicy = false,
+}: {
+  children: ReactNode;
+  syncTorrentEnginePolicy?: boolean;
+}) {
+  const sourceRef = useRef<SettingsSource>({ profileId: "default", linked: true });
+  // The latest settings outside React: every change goes through setSettings, which also feeds the module setters.
+  const initialRef = useRef<Settings | null>(null);
+  const initial =
+    initialRef.current ??
+    (initialRef.current = (() => {
+      seedSharedFromLegacy();
+      const src = readActiveSource();
+      sourceRef.current = src;
+      const s = loadEffective(src.profileId, src.linked);
+      setUiLanguage(s.uiLanguage, s.region);
+      setTmdbLanguage(s.tmdbLanguage);
+      applyProviderKeys(s);
+      return s;
+    })());
+  const [settings, setReactSettings] = useState<Settings>(initial);
+  const writerRef = useRef<ReturnType<typeof createSettingsWriter> | null>(null);
+  if (!writerRef.current) {
+    writerRef.current = createSettingsWriter(
+      initial,
+      { tmdbLanguage: setTmdbLanguage, providerKeys: applyProviderKeys },
+      setReactSettings,
+    );
+  }
+  const writer = writerRef.current;
+  const setSettings = writer.set;
+  // The writer holds the latest value; this store holds the committed one, so selectors never read a render-in-progress.
+  const storeRef = useRef<SettingsStore | null>(null);
+  if (!storeRef.current) storeRef.current = createSettingsStore(settings);
+  const store = storeRef.current;
+  useLayoutEffect(() => store.set(settings), [store, settings]);
+  const [settingsReady, setSettingsReady] = useState(false);
+  const settingsReadyRef = useRef(settingsReady);
+  useEffect(() => {
+    settingsReadyRef.current = settingsReady;
+  }, [settingsReady]);
+  const [torrentEnginePolicyPending, setTorrentEnginePolicyPending] = useState(false);
+  const [torrentEnginePolicyError, setTorrentEnginePolicyError] = useState(false);
+
+  useEffect(() => {
+    setUiLanguage(settings.uiLanguage, settings.region);
+  }, [settings.uiLanguage, settings.region]);
+
+  const lastSavedImageRef = useRef<{ profileId: string; image: string | null }>({
+    profileId: sourceRef.current.profileId,
+    image: null,
+  });
+
+  useEffect(() => {
+    let cancelled = false;
+    const activeId = sourceRef.current.profileId;
+    void loadBgImage(activeId).then((img) => {
+      if (cancelled || !img) return;
+      lastSavedImageRef.current = { profileId: activeId, image: img };
+      setSettings((s) =>
+        s.theme.backgroundImage ? s : { ...s, theme: { ...s.theme, backgroundImage: img } },
+      );
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (localStorage.getItem(STORAGE_KEY)) {
+      setSettingsReady(true);
+      return;
+    }
+    let cancelled = false;
+    void readSettingsFile().then((raw) => {
+      if (cancelled) return;
+      if (raw && !localStorage.getItem(STORAGE_KEY)) {
+        try {
+          localStorage.setItem(STORAGE_KEY, raw);
+          seedSharedFromLegacy();
+          setSettings(loadEffective(sourceRef.current.profileId, sourceRef.current.linked));
+        } catch {}
+      }
+      setSettingsReady(true);
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  useEffect(() => {
+    setSettings((s) => (isRemovedBuiltinAvatar(s.harborAvatar) ? { ...s, harborAvatar: null } : s));
+  }, []);
+
+  useEffect(() => {
+    const activeId = sourceRef.current.profileId;
+    const img = settings.theme.backgroundImage;
+    if (
+      lastSavedImageRef.current.profileId === activeId &&
+      lastSavedImageRef.current.image === img
+    ) {
+      return;
+    }
+    lastSavedImageRef.current = { profileId: activeId, image: img };
+    void saveBgImage(img, activeId);
+  }, [settings.theme.backgroundImage]);
+
+  const fileTimerRef = useRef(0);
+  const persistTimerRef = useRef(0);
+  const lastPersistAtRef = useRef(0);
+  const pendingPersistRef = useRef<({ settings: Settings } & SettingsSource) | null>(null);
+  const pendingFileJsonRef = useRef<string | null>(null);
+  const flushFile = useCallback(() => {
+    window.clearTimeout(fileTimerRef.current);
+    const json = pendingFileJsonRef.current;
+    pendingFileJsonRef.current = null;
+    if (json != null) void writeSettingsFile(json);
+  }, []);
+  const flushPersist = useCallback(() => {
+    window.clearTimeout(persistTimerRef.current);
+    persistTimerRef.current = 0;
+    const pending = pendingPersistRef.current;
+    if (!pending) return;
+    pendingPersistRef.current = null;
+    lastPersistAtRef.current = Date.now();
+    try {
+      const json = persistEffective(pending.settings, pending.profileId, pending.linked);
+      pendingFileJsonRef.current = json;
+      window.clearTimeout(fileTimerRef.current);
+      fileTimerRef.current = window.setTimeout(flushFile, 600);
+    } catch (e) {
+      if (e instanceof DOMException && (e.name === "QuotaExceededError" || e.code === 22)) {
+        console.warn("[settings] localStorage quota exceeded, dropping avatar");
+        if (pending.settings.harborAvatar != null) {
+          setSettings((s) => ({ ...s, harborAvatar: null }));
+        }
+      }
+    }
+  }, [flushFile]);
+  // Settling merges stored secrets (store wins) and bumps the epoch, so one persist moves blob-only keys to the store.
+  const [secretsEpoch, setSecretsEpoch] = useState(0);
+  useEffect(
+    () =>
+      subscribeSecretsSettled(() => {
+        const { profileId, linked } = sourceRef.current;
+        setSettings((s) => mergeSecrets(s, readSettingsSecrets(profileId, linked)));
+        setSecretsEpoch((n) => n + 1);
+      }),
+    [],
+  );
+  // The blob carries its secrets while secrets.json writes fail, so each change of write health re-persists it.
+  useEffect(() => {
+    let ok = getSecretsWriteStatus().ok;
+    return subscribeSecretsWriteStatus(() => {
+      if (getSecretsWriteStatus().ok === ok) return;
+      ok = !ok;
+      setSecretsEpoch((n) => (n === 0 ? 0 : n + 1));
+    });
+  }, []);
+  // Secret edits reach the store only after settling and only within one scope, so a profile switch never copies keys.
+  const secretBaselineRef = useRef<{ settings: Settings; scope: string } | null>(null);
+  useEffect(() => {
+    if (secretsEpoch === 0) return;
+    const { profileId, linked } = sourceRef.current;
+    const scope = sourceKeyFor(profileId, linked);
+    const prev = secretBaselineRef.current;
+    secretBaselineRef.current = { settings, scope };
+    if (prev?.scope !== scope) return;
+    writeSettingsSecrets(profileId, linked, changedSecrets(prev.settings, settings));
+  }, [settings, secretsEpoch]);
+  // A lone change persists at once; a burst (slider drag) persists its latest value at most every PERSIST_BURST_MS.
+  useEffect(() => {
+    if (!settingsReady) return;
+    pendingPersistRef.current = { settings, ...sourceRef.current };
+    const wait = lastPersistAtRef.current + PERSIST_BURST_MS - Date.now();
+    if (wait <= 0) flushPersist();
+    else if (!persistTimerRef.current)
+      persistTimerRef.current = window.setTimeout(flushPersist, wait);
+  }, [settings, settingsReady, flushPersist, secretsEpoch]);
+  useEffect(() => {
+    // Leaving the page writes settings.json and secrets.json at once, since Rust reads them at the next launch.
+    const flushAll = () => {
+      flushPersist();
+      flushFile();
+      void flushSecrets();
+    };
+    const onHidden = () => {
+      if (document.visibilityState === "hidden") flushAll();
+    };
+    window.addEventListener("pagehide", flushAll);
+    window.addEventListener("beforeunload", flushAll);
+    document.addEventListener("visibilitychange", onHidden);
+    return () => {
+      window.removeEventListener("pagehide", flushAll);
+      window.removeEventListener("beforeunload", flushAll);
+      document.removeEventListener("visibilitychange", onHidden);
+      flushAll();
+    };
+  }, [flushPersist, flushFile]);
+
+  useEffect(() => {
+    if (!syncTorrentEnginePolicy || !settingsReady || !("__TAURI_INTERNALS__" in window)) return;
+    let cancelled = false;
+    setTorrentEnginePolicyPending(true);
+    setTorrentEnginePolicyError(false);
+    void torrentEngineSetEnabled(!settings.torrentsDisabled)
+      .then(() => {
+        if (!cancelled) setTorrentEnginePolicyPending(false);
+      })
+      .catch(() => {
+        if (!cancelled) {
+          setTorrentEnginePolicyPending(false);
+          setTorrentEnginePolicyError(true);
+        }
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [settings.torrentsDisabled, settingsReady, syncTorrentEnginePolicy]);
+
+  const tmdbLangRef = useRef<string | null>(null);
+  useEffect(() => {
+    const eff = effectiveTmdbLanguage();
+    if (tmdbLangRef.current === null) {
+      tmdbLangRef.current = eff;
+      return;
+    }
+    if (tmdbLangRef.current === eff) return;
+    tmdbLangRef.current = eff;
+    window.location.reload();
+  }, [settings.tmdbLanguage]);
+
+  const imgLangRef = useRef<string | null>(null);
+  useEffect(() => {
+    const sig = settings.tmdbImageLangs.join(",");
+    if (imgLangRef.current === null) {
+      imgLangRef.current = sig;
+      return;
+    }
+    if (imgLangRef.current === sig) return;
+    imgLangRef.current = sig;
+    const t = window.setTimeout(() => window.location.reload(), 1200);
+    return () => window.clearTimeout(t);
+  }, [settings.tmdbImageLangs]);
+
+  useEffect(() => {
+    applyTheme(settings.theme);
+  }, [settings.theme]);
+
+  useEffect(() => {
+    document.documentElement.style.setProperty("--poster-radius", `${settings.posterRadius}px`);
+  }, [settings.posterRadius]);
+
+  useEffect(() => {
+    const scale = settings.uiScale > 0 ? settings.uiScale : 1;
+    const root = document.getElementById("root") as
+      | (HTMLElement & { style: CSSStyleDeclaration & { zoom?: string } })
+      | null;
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      void import("@tauri-apps/api/webview")
+        .then(({ getCurrentWebview }) => getCurrentWebview().setZoom(scale))
+        .catch(() => {});
+      if (root) root.style.zoom = scale !== 1 ? "1" : "";
+    } else if (root) {
+      root.style.zoom = scale !== 1 ? String(scale) : "";
+    }
+  }, [settings.uiScale]);
+
+  useEffect(() => {
+    if (typeof window === "undefined" || !("__TAURI_INTERNALS__" in window)) return;
+    const shouldServe = settings.serveWebUi || settings.remoteControlEnabled;
+    void import("@tauri-apps/api/core").then(({ invoke }) => {
+      if (shouldServe) invoke("web_serve_start").catch(() => {});
+      else invoke("web_serve_stop").catch(() => {});
+    });
+  }, [settings.serveWebUi, settings.remoteControlEnabled]);
+
+  useEffect(() => {
+    setPosterBaseUrl(settings.posterBaseUrl);
+  }, [settings.posterBaseUrl]);
+
+  useEffect(() => {
+    setMdblistBatchKey(settings.mdblistKey);
+  }, [settings.mdblistKey]);
+
+  useEffect(() => {
+    if (typeof document === "undefined" || !("fonts" in document)) return;
+    const fonts = settings.customFonts ?? [];
+    const desiredFamilies = new Set(fonts.map((f) => `harbor-font-${f.id}`));
+    let cancelled = false;
+    void (async () => {
+      for (const f of fonts) {
+        const family = `harbor-font-${f.id}`;
+        let exists = false;
+        document.fonts.forEach((ff) => {
+          if (ff.family === family) exists = true;
+        });
+        if (exists) continue;
+        const dataUrl = f.dataUrl ?? (await loadFontData(f.id));
+        if (cancelled || !dataUrl) continue;
+        try {
+          const ff = new FontFace(family, `url(${dataUrl})`, { display: "swap" });
+          const loaded = await ff.load();
+          if (!cancelled) document.fonts.add(loaded);
+        } catch (e) {
+          console.warn("[fonts] failed to load", family, e);
+        }
+      }
+      if (cancelled) return;
+      try {
+        const { syncSubFontsToDisk } = await import("@/lib/player/sub-font-install");
+        await syncSubFontsToDisk(fonts);
+      } catch (e) {
+        console.warn("[fonts] could not sync fonts to disk for libass", e);
+      }
+    })();
+    return () => {
+      cancelled = true;
+      const toRemove: FontFace[] = [];
+      document.fonts.forEach((ff) => {
+        if (ff.family.startsWith("harbor-font-") && !desiredFamilies.has(ff.family)) {
+          toRemove.push(ff);
+        }
+      });
+      for (const ff of toRemove) document.fonts.delete(ff);
+    };
+  }, [settings.customFonts]);
+
+  useEffect(() => {
+    const fallback = fontFamilyAfterRemoval(settings.subFontFamily, settings.customFonts ?? []);
+    if (fallback) setSettings((s) => ({ ...s, subFontFamily: fallback }));
+  }, [settings.subFontFamily, settings.customFonts]);
+
+  const fontMigratedRef = useRef(false);
+  useEffect(() => {
+    if (fontMigratedRef.current) return;
+    const legacy = (settings.customFonts ?? []).filter((f) => f.dataUrl);
+    if (legacy.length === 0) return;
+    fontMigratedRef.current = true;
+    void (async () => {
+      const moved = await migrateInlineFonts(legacy, saveFontData, (id, e) =>
+        console.warn("[fonts] keeping inline copy, IDB write failed for", id, e),
+      );
+      if (moved.size === 0) return;
+      setSettings((s) => ({ ...s, customFonts: stripMovedFonts(s.customFonts ?? [], moved) }));
+    })();
+  }, [settings.customFonts]);
+
+  useEffect(() => {
+    void import("@/lib/privacy/blocklist").then(({ setTrackerBlocking }) => {
+      setTrackerBlocking(settings.blockTrackers);
+    });
+    if (settingsReady && "__TAURI_INTERNALS__" in window) {
+      void import("@tauri-apps/api/core")
+        .then(({ invoke }) => invoke("privacy_set_enabled", { enabled: settings.blockTrackers }))
+        .catch((error) => console.warn("Stream blocker preference could not be applied", error));
+    }
+  }, [settings.blockTrackers, settingsReady]);
+
+  useEffect(() => {
+    void import("@/lib/snapshots").then(({ setSnapshotRetentionDays }) => {
+      setSnapshotRetentionDays(settings.cwSnapshotRetentionDays);
+    });
+  }, [settings.cwSnapshotRetentionDays]);
+
+  useEffect(() => {
+    window.__harborStremioDeeplink = settings.stremioDeeplinkInstall;
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void import("@tauri-apps/api/core").then(({ invoke }) => {
+      void invoke("deeplink_set_stremio", { enabled: settings.stremioDeeplinkInstall }).catch((e) =>
+        console.warn("[harbor] deeplink_set_stremio failed", e),
+      );
+    });
+  }, [settings.stremioDeeplinkInstall]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void import("@tauri-apps/api/window").then(({ getCurrentWindow }) => {
+      getCurrentWindow()
+        .setDecorations(settings.useNativeTitleBar)
+        .catch((e) => console.warn("[harbor] setDecorations failed", e));
+    });
+  }, [settings.useNativeTitleBar]);
+
+  useEffect(() => {
+    void applyAppIcon(settings.customAppIcon);
+  }, [settings.customAppIcon]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    void import("@tauri-apps/api/core").then(({ invoke }) => {
+      void invoke("tray_set_prefs", {
+        prefs: {
+          closeToTray: settings.closeToTray,
+          alwaysOnTop: settings.trayAlwaysOnTop,
+          pauseMinimized: settings.pauseMinimized,
+          pauseUnfocused: settings.pauseUnfocused,
+        },
+      }).catch((e) => console.warn("[harbor] tray_set_prefs failed", e));
+    });
+  }, [
+    settings.closeToTray,
+    settings.trayAlwaysOnTop,
+    settings.pauseMinimized,
+    settings.pauseUnfocused,
+  ]);
+
+  useEffect(() => {
+    if (!("__TAURI_INTERNALS__" in window)) return;
+    let cancelled = false;
+    const unlisteners: Array<() => void> = [];
+    const track = (rawUnlisten: () => void) => {
+      const u = makeSafeTauriUnlisten(rawUnlisten);
+      if (cancelled) u();
+      else unlisteners.push(u);
+    };
+    void import("@tauri-apps/api/event").then(({ listen }) => {
+      void listen<{
+        closeToTray: boolean;
+        alwaysOnTop: boolean;
+        pauseMinimized: boolean;
+        pauseUnfocused: boolean;
+      }>("harbor://tray-prefs", (e) => {
+        const p = e.payload;
+        setSettings((s) => ({
+          ...s,
+          closeToTray: p.closeToTray,
+          trayAlwaysOnTop: p.alwaysOnTop,
+          pauseMinimized: p.pauseMinimized,
+          pauseUnfocused: p.pauseUnfocused,
+        }));
+      }).then(track);
+      void listen("harbor://cycle-theme", () => {
+        setSettings((s) => ({
+          ...s,
+          theme: { ...s.theme, preset: nextColorTheme(s.theme.preset) },
+        }));
+      }).then(track);
+      void listen<string>("harbor://set-theme", (e) => {
+        const id = e.payload;
+        if (!id || (!isKnownPreset(id) && !id.startsWith("user:"))) return;
+        setSettings((s) => ({ ...s, theme: { ...s.theme, preset: id as typeof s.theme.preset } }));
+      }).then(track);
+    });
+    return () => {
+      cancelled = true;
+      unlisteners.forEach((u) => u());
+    };
+  }, []);
+
+  useEffect(() => {
+    let unsub: (() => void) | undefined;
+    let cancelled = false;
+    void import("@tauri-apps/api/core").then(({ invoke }) => {
+      if (cancelled) return;
+      const push = () => {
+        const themes = getCustomThemes().map((t) => ({ id: t.id, name: t.name }));
+        void invoke("tray_set_custom_themes", { themes }).catch(() => {});
+      };
+      push();
+      unsub = subscribeCustomThemes(push);
+    });
+    return () => {
+      cancelled = true;
+      unsub?.();
+    };
+  }, []);
+
+  const update = useCallback(
+    (patch: Partial<Settings>) => {
+      setSettings((s) => applySettingsPatch(s, patch));
+      // Account sync queues only synced sections whose patched value differs from the last committed settings.
+      const changed = changedSettingsKeys(store.get(), patch);
+      for (const [section, field] of SYNCED_SETTINGS_FIELDS) {
+        if (changed.has(field)) markSectionDirty(section);
+      }
+    },
+    [store],
+  );
+
+  // Same contract as the roster store: sync reads and writes through the provider for
+  // the ACTIVE profile, and straight to disk for any other, because only the active
+  // profile has live React state that a direct write would lose.
+  useEffect(() => {
+    configureLayoutStore({
+      activeProfileId: () => sourceRef.current.profileId,
+      isLinked: (profileId) =>
+        profileId === sourceRef.current.profileId ? sourceRef.current.linked : true,
+      readActive: () => writer.get(),
+      writeActive: (patch) => setSettings((s) => ({ ...s, ...patch })),
+    });
+    return () => configureLayoutStore(null);
+  }, []);
+
+  useEffect(() => {
+    try {
+      if (localStorage.getItem("harbor.migrate.tvdbpanel.v1")) return;
+      localStorage.setItem("harbor.migrate.tvdbpanel.v1", "1");
+      if (!writer.get().tvdbOrderPanel) {
+        update({ tvdbOrderPanel: true, episodeOrderProvider: "tvdb" });
+      }
+    } catch {
+      /* noop */
+    }
+  }, [update]);
+
+  const toggleStreaming = useCallback((svc: StreamingService) => {
+    setSettings((s) => ({
+      ...s,
+      streaming: { ...s.streaming, [svc]: !s.streaming[svc] },
+    }));
+  }, []);
+
+  const switchProfile = useCallback(
+    (profileId: string, linked: boolean) => {
+      const cur = sourceRef.current;
+      if (cur.profileId === profileId && cur.linked === linked) {
+        return;
+      }
+
+      if (sourceKeyFor(cur.profileId, cur.linked) === sourceKeyFor(profileId, linked)) {
+        sourceRef.current = { profileId, linked };
+      } else {
+        flushPersist();
+        if (settingsReadyRef.current) persistEffective(writer.get(), cur.profileId, cur.linked);
+        const next = loadEffective(profileId, linked);
+        setUiLanguage(next.uiLanguage, next.region);
+        setTmdbLanguage(next.tmdbLanguage);
+        tmdbLangRef.current = effectiveTmdbLanguage();
+        imgLangRef.current = next.tmdbImageLangs.join(",");
+        sourceRef.current = { profileId, linked };
+        if (settingsReadyRef.current) persistEffective(next, profileId, linked);
+        setSettings(next);
+      }
+
+      lastSavedImageRef.current = { profileId, image: null };
+      setSettings((s) => ({ ...s, theme: { ...s.theme, backgroundImage: null } }));
+
+      void loadBgImage(profileId).then((img) => {
+        if (sourceRef.current.profileId !== profileId) return;
+        lastSavedImageRef.current = { profileId, image: img };
+        setSettings((s) => ({ ...s, theme: { ...s.theme, backgroundImage: img } }));
+      });
+    },
+    [flushPersist, setSettings],
+  );
+
+  const setSettingsLinked = useCallback(
+    (linked: boolean) => {
+      const cur = sourceRef.current;
+      if (cur.linked === linked) return;
+      if (!linked) forkToProfile(cur.profileId);
+      switchProfile(cur.profileId, linked);
+    },
+    [switchProfile],
+  );
+
+  const value = useMemo(
+    () => ({
+      settings,
+      torrentEnginePolicyPending,
+      torrentEnginePolicyError,
+      update,
+      toggleStreaming,
+      switchProfile,
+      setSettingsLinked,
+    }),
+    [
+      settings,
+      torrentEnginePolicyPending,
+      torrentEnginePolicyError,
+      update,
+      toggleStreaming,
+      switchProfile,
+      setSettingsLinked,
+    ],
+  );
+
+  const actions = useMemo(
+    () => ({ update, toggleStreaming, switchProfile, setSettingsLinked }),
+    [update, toggleStreaming, switchProfile, setSettingsLinked],
+  );
+
+  return (
+    <StoreCtx.Provider value={store}>
+      <UpdateCtx.Provider value={update}>
+        <ActionsCtx.Provider value={actions}>
+          <Ctx.Provider value={value}>{children}</Ctx.Provider>
+        </ActionsCtx.Provider>
+      </UpdateCtx.Provider>
+    </StoreCtx.Provider>
+  );
+}
+
+/** The stable settings actions (update, toggleStreaming, switchProfile, setSettingsLinked); never re-renders its caller. */
+export function useSettingsActions(): SettingsActions {
+  const actions = useContext(ActionsCtx);
+  if (!actions) throw new Error("useSettingsActions outside SettingsProvider");
+  return actions;
+}
+
+export function useSettings() {
+  const v = useContext(Ctx);
+  if (!v) throw new Error("useSettings outside SettingsProvider");
+  return v;
+}
+
+/** Re-renders the caller only when the selection changes (shallow compare for plain objects). */
+export function useSettingsSelector<T>(select: (s: Settings) => T): T {
+  const store = useContext(StoreCtx);
+  if (!store) throw new Error("useSettingsSelector outside SettingsProvider");
+  const selectRef = useRef(select);
+  selectRef.current = select;
+  const readerRef = useRef<{ store: SettingsStore; read: () => T } | null>(null);
+  if (readerRef.current?.store !== store) {
+    readerRef.current = { store, read: createSelectionReader(store, () => selectRef.current) };
+  }
+  const read = readerRef.current.read;
+  return useSyncExternalStore(store.subscribe, read, read);
+}
+
+/** A stable reader of the latest committed settings, for effects and callbacks; never re-renders its caller. */
+export function useSettingsGetter(): () => Settings {
+  const store = useContext(StoreCtx);
+  if (!store) throw new Error("useSettingsGetter outside SettingsProvider");
+  return store.get;
+}
+
+/** The stable settings `update`; never re-renders its caller. */
+export function useSettingsUpdate(): SettingsValue["update"] {
+  const update = useContext(UpdateCtx);
+  if (!update) throw new Error("useSettingsUpdate outside SettingsProvider");
+  return update;
+}

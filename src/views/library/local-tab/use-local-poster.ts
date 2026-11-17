@@ -1,0 +1,48 @@
+import { useEffect, useState } from "react";
+import { convertFileSrc } from "@tauri-apps/api/core";
+import { usePosterChain } from "@/components/poster";
+import { fetchMovieAssets } from "@/lib/providers/tmdb/tmdb-images";
+import { imageLangPriority } from "@/lib/providers/tmdb/tmdb-image-lang";
+import { IMG } from "@/lib/providers/tmdb/tmdb-client";
+import { useSettingsSelector } from "@/lib/settings";
+import type { LocalEntry } from "@/lib/local-library";
+
+function artSrc(value: string): string {
+  return /^https?:\/\//i.test(value) ? value : convertFileSrc(value);
+}
+
+export function useLocalPoster(entry: LocalEntry) {
+  const settings = useSettingsSelector((s) => ({ rpdbKey: s.rpdbKey, tmdbKey: s.tmdbKey }));
+  const localPoster = entry.localArt?.poster ? artSrc(entry.localArt.poster) : undefined;
+  const posterKey = `${entry.tmdbId}\n${entry.type}\n${settings.tmdbKey}\n${localPoster}`;
+  const [found, setFound] = useState<{ key: string; src: string } | null>(null);
+  const localized = found?.key === posterKey ? found.src : undefined;
+
+  useEffect(() => {
+    if (localPoster || entry.tmdbId == null || !settings.tmdbKey) return;
+    let alive = true;
+    const kind = entry.type === "show" ? "tv" : "movie";
+    const metaId = `tmdb:${kind}:${entry.tmdbId}`;
+    const langs = imageLangPriority();
+    const rankOf = (iso: string | null | undefined) =>
+      langs.indexOf(iso ? iso.toLowerCase() : null);
+    void fetchMovieAssets(settings.tmdbKey, metaId).then((assets) => {
+      if (!alive) return;
+      const best = (assets?.posters ?? [])
+        .map((p) => ({ p, i: rankOf(p.iso_639_1) }))
+        .filter((x) => x.i !== -1)
+        .sort((a, b) => a.i - b.i || (b.p.vote_average ?? 0) - (a.p.vote_average ?? 0))[0]?.p;
+      if (best?.file_path) setFound({ key: posterKey, src: `${IMG}/w342${best.file_path}` });
+    });
+    return () => {
+      alive = false;
+    };
+  }, [entry.tmdbId, entry.type, settings.tmdbKey, localPoster, posterKey]);
+
+  return usePosterChain(
+    settings.rpdbKey,
+    entry.imdbId ?? `local:${entry.id}`,
+    localPoster ?? localized ?? entry.poster ?? undefined,
+    entry.type === "show" ? "series" : "movie",
+  );
+}

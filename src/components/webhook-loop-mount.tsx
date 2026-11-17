@@ -1,0 +1,91 @@
+import { useEffect, useLayoutEffect, useRef } from "react";
+import { useAuth } from "@/lib/auth";
+import { useSettingsGetter, useSettingsSelector } from "@/lib/settings";
+import { proactiveStorageCleanup } from "@/lib/storage-recovery";
+import { runWebhookTick } from "@/lib/webhook-engine";
+
+const TICK_INTERVAL_MS = 30 * 60 * 1000;
+const INITIAL_DELAY_MS = 90 * 1000;
+const STATUS_KEY = "harbor.webhook.lastTick";
+
+async function runTickAndRecord(
+  getSettings: ReturnType<typeof useSettingsGetter>,
+  authKey: Parameters<typeof runWebhookTick>[1],
+): Promise<void> {
+  try {
+    const result = await runWebhookTick(getSettings(), authKey);
+    try {
+      localStorage.setItem(
+        STATUS_KEY,
+        JSON.stringify({
+          at: Date.now(),
+          fired: result.fired,
+          channels: result.channels,
+        }),
+      );
+    } catch {}
+    if (result.fired > 0) {
+      console.info(`[webhook] fired ${result.fired} new items`);
+    }
+  } catch (e) {
+    console.warn("[webhook] tick failed", e);
+  }
+}
+
+export function WebhookLoopMount() {
+  const webhooks = useSettingsSelector((s) => s.webhooks);
+  const getSettings = useSettingsGetter();
+  const { authKey } = useAuth();
+  const authRef = useRef(authKey);
+  useLayoutEffect(() => {
+    authRef.current = authKey;
+  }, [authKey]);
+  const runningRef = useRef(false);
+
+  useEffect(() => {
+    proactiveStorageCleanup();
+  }, []);
+
+  useEffect(() => {
+    const hasDestination =
+      !!webhooks.discordUrl || !!webhooks.telegramUrl || webhooks.desktopEnabled;
+    if (!hasDestination) return;
+    let cancelled = false;
+
+    const tick = async () => {
+      if (runningRef.current || cancelled) return;
+      runningRef.current = true;
+      await runTickAndRecord(getSettings, authRef.current).finally(() => {
+        runningRef.current = false;
+      });
+    };
+
+    const initialTimer = window.setTimeout(() => {
+      void tick();
+    }, INITIAL_DELAY_MS);
+    const interval = window.setInterval(() => {
+      void tick();
+    }, TICK_INTERVAL_MS);
+    const onFocus = () => {
+      const raw = (() => {
+        try {
+          return localStorage.getItem(STATUS_KEY);
+        } catch {
+          return null;
+        }
+      })();
+      const last = raw ? ((JSON.parse(raw) as { at?: number }).at ?? 0) : 0;
+      if (Date.now() - last > TICK_INTERVAL_MS) void tick();
+    };
+    window.addEventListener("focus", onFocus);
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(initialTimer);
+      window.clearInterval(interval);
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [webhooks.discordUrl, webhooks.telegramUrl, webhooks.desktopEnabled, getSettings]);
+
+  return null;
+}

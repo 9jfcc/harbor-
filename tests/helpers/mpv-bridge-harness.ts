@@ -1,0 +1,291 @@
+// @ts-expect-error Node test types are intentionally outside the browser-only tsconfig.
+import { readFileSync } from "node:fs";
+import ts from "typescript";
+import * as snapshots from "../../src/lib/player/bridge.ts";
+import * as selection from "../../src/lib/player/subtitle-selection.ts";
+import * as cleanups from "../../src/lib/player/prepared-subtitle-cleanups.ts";
+import * as seeds from "../../src/lib/subtitles/seed-batch.ts";
+import * as failures from "../../src/lib/player/mpv-failure.ts";
+import * as tracks from "../../src/lib/player/mpv-tracks.ts";
+import * as language from "../../src/lib/subtitles/language.ts";
+import * as translationJobs from "../../src/lib/subtitles/translation-jobs.ts";
+import type { PlayerBridge, PlayerSnapshot } from "../../src/lib/player/bridge.ts";
+import type { MpvOptions } from "../../src/lib/player/mpv.ts";
+
+export function deferred<T = void>() {
+  let resolve!: (value: T) => void;
+  let reject!: (error: Error) => void;
+  const promise = new Promise<T>((ok, fail) => {
+    resolve = ok;
+    reject = fail;
+  });
+  return { promise, resolve, reject };
+}
+
+export async function flushBridge() {
+  for (let i = 0; i < 40; i += 1) await Promise.resolve();
+}
+
+export function playerSnapshotChanged() {
+  const source = readFileSync(
+    new URL("../../src/views/player/hooks/use-player-bridge.ts", import.meta.url),
+    "utf8",
+  );
+  const ast = ts.createSourceFile("hook.ts", source, ts.ScriptTarget.Latest, true);
+  const comparator = ast.statements.find(
+    (node) => ts.isFunctionDeclaration(node) && node.name?.text === "snapChangedIgnoringClock",
+  );
+  if (!comparator) throw new Error("Player snapshot comparator not found");
+  const compiled = ts.transpileModule(comparator.getText(ast), {
+    compilerOptions: { target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  return new Function(`${compiled}; return snapChangedIgnoringClock;`)() as (
+    a: PlayerSnapshot,
+    b: PlayerSnapshot,
+  ) => boolean;
+}
+
+export function mpvBridgeHarness(
+  prefs = { volume: 0.35, muted: false },
+  options?: MpvOptions,
+  harness: {
+    safeProviderUrl?: (url: string) => boolean;
+    /** Stands in for subtitleTrackDownloadHeaders; its result reaches prepareSubtitle. */
+    trackHeaders?: (...args: any[]) => Record<string, string> | undefined;
+    /** Answer of isWindowsDesktop() (default true). */
+    windows?: boolean;
+  } = {},
+) {
+  const source = readFileSync(new URL("../../src/lib/player/mpv.ts", import.meta.url), "utf8");
+  const compiled = ts.transpileModule(source, {
+    compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 },
+  }).outputText;
+  const compileSibling = (name: string) =>
+    ts.transpileModule(
+      readFileSync(new URL(`../../src/lib/player/${name}.ts`, import.meta.url), "utf8"),
+      { compilerOptions: { module: ts.ModuleKind.CommonJS, target: ts.ScriptTarget.ES2022 } },
+    ).outputText;
+  const handlers = new Map<string, (event: { payload: unknown }) => void>();
+  const commands: Array<{ command: string; args: Record<string, unknown> }> = [];
+  const errors: string[] = [];
+  const properties = new Map<string, unknown>([
+    ["sid", "no"],
+    ["secondary-sid", "no"],
+  ]);
+  let reset: () => Promise<void> = async () => {};
+  let write: (name: string, value: unknown) => Promise<void> = async () => {};
+  let nativeInvoke: ((command: string, args: Record<string, unknown>) => Promise<unknown>) | null =
+    null;
+  let prepare: (input: { url: string }) => Promise<unknown> = async ({ url }) => ({
+    playableUrl: url,
+    format: "srt",
+    cues: [{ start: 0, end: 1, text: "fixture" }],
+    cleanup() {},
+  });
+  const transferred = new Map<string, unknown>();
+  const dependencies: Record<string, unknown> = {
+    "@tauri-apps/api/core": {
+      invoke: async (command: string, args: Record<string, unknown> = {}) => {
+        commands.push({ command, args });
+        if (nativeInvoke) return nativeInvoke(command, args);
+        if (command === "mpv_set_property") {
+          await write(String(args.name), args.value);
+          properties.set(String(args.name), args.value);
+        }
+        if (command === "mpv_get_property") return properties.get(String(args.name)) ?? "";
+      },
+    },
+    "@tauri-apps/api/event": {
+      listen: async (name: string, handler: (event: { payload: unknown }) => void) => {
+        handlers.set(name, handler);
+        return () => handlers.delete(name);
+      },
+    },
+    "@/lib/subtitles/prepare": {
+      prepareSubtitle: (input: { url: string }) => prepare(input),
+      SubtitlePreparationError: class SubtitlePreparationError extends Error {
+        reason: string;
+        constructor(reason: string, message: string) {
+          super(message);
+          this.name = "SubtitlePreparationError";
+          this.reason = reason;
+        }
+      },
+    },
+    "@/lib/subtitles/provider-auth": {
+      subtitleTrackDownloadHeaders: harness.trackHeaders ?? (() => undefined),
+    },
+    "@/lib/subtitles/prepared-registry": {
+      takePreparedSubtitle: (url: string) => {
+        const entry = transferred.get(url) ?? null;
+        transferred.delete(url);
+        return entry;
+      },
+    },
+    "@/lib/subtitles/limit-signal": { markLimitReached() {} },
+    "@/lib/subtitles/pending-subs": {
+      markPendingSub() {},
+      clearPendingSub() {},
+      wasPendingSub: () => false,
+    },
+    "@/lib/subtitles/translation-jobs": { ...translationJobs, registerTranslationJob() {} },
+    "@/lib/subtitles/language": language,
+    "./mpv-failure": failures,
+    "@/lib/platform": {
+      isWindowsDesktop: () => harness.windows ?? true,
+      isLinuxDesktop: () => false,
+      isMacDesktop: () => false,
+    },
+    "@/lib/tauri-unlisten": { makeSafeTauriUnlisten: (fn: unknown) => fn },
+    "./mpv-properties": {
+      resetMpvSubtitleFpsForTransition: () => reset(),
+      invalidateMpvSubtitleFpsContext() {},
+      markMpvSubtitleFpsSessionRecreated() {},
+    },
+    "./subtitle-fps": { SUBTITLE_FPS_TRANSITION_FAILED_EVENT: "selection-failed" },
+    "@/lib/perf/playback-trace": { finishPlaybackTrace() {}, markPlaybackTrace() {} },
+    "./prepared-subtitle-cleanups": cleanups,
+    "./subtitle-selection": selection,
+    "@/lib/subtitles/seed-batch": seeds,
+    "@/lib/subtitles/provider-url": {
+      isSafeProviderSubtitleUrl: harness.safeProviderUrl ?? (() => true),
+    },
+    "./bridge": {
+      ...snapshots,
+      initialPlayerSnapshot: () => ({ ...snapshots.emptySnapshot, ...prefs }),
+    },
+  };
+  const module = {
+    exports: {} as {
+      createMpvBridge: (options?: MpvOptions) => PlayerBridge;
+      probeMpv: () => Promise<unknown>;
+    },
+  };
+  const windowEvents = new EventTarget();
+  const windowListeners = new Map<string, Set<unknown>>();
+  const frames = new Map<number, FrameRequestCallback>();
+  let frameId = 0;
+  const documentEvents = new EventTarget();
+  const fakeDocument = {
+    addEventListener: documentEvents.addEventListener.bind(documentEvents),
+    removeEventListener: documentEvents.removeEventListener.bind(documentEvents),
+  };
+  const fakeWindow = {
+    requestAnimationFrame: (callback: FrameRequestCallback) => {
+      frames.set(++frameId, callback);
+      return frameId;
+    },
+    cancelAnimationFrame: (id: number) => frames.delete(id),
+    // Resolved at call time so t.mock.timers can drive the bridge's timers.
+    setTimeout: (callback: () => void, ms?: number) => globalThis.setTimeout(callback, ms),
+    clearTimeout: (id: ReturnType<typeof setTimeout>) => globalThis.clearTimeout(id),
+    addEventListener: (name: string, listener: EventListener) => {
+      if (!windowListeners.has(name)) windowListeners.set(name, new Set());
+      windowListeners.get(name)!.add(listener);
+      windowEvents.addEventListener(name, listener);
+    },
+    removeEventListener: (name: string, listener: EventListener) => {
+      windowListeners.get(name)?.delete(listener);
+      windowEvents.removeEventListener(name, listener);
+    },
+    dispatchEvent: (event: Event) => {
+      errors.push(event.type);
+      return windowEvents.dispatchEvent(event);
+    },
+  };
+  dependencies["./mpv-tracks"] = tracks;
+  // The bridge's own sub-modules run for real against the same fake window and native bridge.
+  for (const name of [
+    "mpv-config",
+    "mpv-events",
+    "mpv-session",
+    "mpv-geometry",
+    "mpv-subtitles",
+    "mpv-audio",
+    "mpv-controls",
+  ]) {
+    const sibling = { exports: {} };
+    new Function(
+      "require",
+      "module",
+      "exports",
+      "window",
+      "console",
+      "document",
+      compileSibling(name),
+    )(
+      (id: string) => {
+        if (!(id in dependencies)) throw new Error(`Unexpected dependency: ${id}`);
+        return dependencies[id];
+      },
+      sibling,
+      sibling.exports,
+      fakeWindow,
+      { warn() {}, info() {} },
+      fakeDocument,
+    );
+    dependencies[`./${name}`] = sibling.exports;
+  }
+  new Function("require", "module", "exports", "window", "console", "document", compiled)(
+    (id: string) => {
+      if (!(id in dependencies)) throw new Error(`Unexpected dependency: ${id}`);
+      return dependencies[id];
+    },
+    module,
+    module.exports,
+    fakeWindow,
+    { warn() {}, info() {} },
+    fakeDocument,
+  );
+  const bridge = module.exports.createMpvBridge(options);
+  let snapshot: PlayerSnapshot = snapshots.emptySnapshot;
+  bridge.subscribe((next) => {
+    snapshot = next;
+  });
+  return {
+    bridge,
+    /** The compiled `mpv.ts` exports (`probeMpv`, `listMpvAudioDevices`, ...). */
+    module: module.exports,
+    createBridge: (next?: MpvOptions) => module.exports.createMpvBridge(next),
+    commands,
+    errors,
+    emitWindow(name: string) {
+      windowEvents.dispatchEvent(new Event(name));
+    },
+    /** Number of listeners the bridge holds on the fake window for `name`. */
+    windowListenerCount: (name: string) => windowListeners.get(name)?.size ?? 0,
+    runFrame() {
+      const callbacks = [...frames.values()];
+      frames.clear();
+      callbacks.forEach((callback) => callback(0));
+    },
+    snapshot: () => snapshot,
+    emitEvent(event: Record<string, unknown>) {
+      handlers.get("mpv://event")?.({ payload: event });
+    },
+    emit(name: string, data: unknown) {
+      properties.set(name, data);
+      handlers.get("mpv://event")?.({ payload: { event: "property-change", name, data } });
+    },
+    resetWith(fn: typeof reset) {
+      reset = fn;
+    },
+    writeWith(fn: typeof write) {
+      write = fn;
+    },
+    prepareWith(fn: typeof prepare) {
+      prepare = fn;
+    },
+    /** Hands a subtitle another window already prepared to the next addSubtitle of `url`. */
+    transferPrepared(url: string, prepared: unknown) {
+      transferred.set(url, prepared);
+    },
+    invokeWith(fn: NonNullable<typeof nativeInvoke>) {
+      nativeInvoke = fn;
+    },
+    picks: () =>
+      commands
+        .filter(({ command, args }) => command === "mpv_set_property" && args.name === "sid")
+        .map(({ args }) => args.value),
+  };
+}

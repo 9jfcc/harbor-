@@ -1,0 +1,526 @@
+import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import { needsImdbForPoster, needsTmdbForPoster, rpdbPoster } from "@/lib/providers/rpdb";
+import { useTitlePoster } from "@/lib/title-poster";
+import {
+  tmdbIdFromImdb,
+  tmdbImdbId,
+  useTmdbIdFromImdb,
+  useTmdbImdbId,
+} from "@/lib/providers/tmdb/tmdb-imdb-resolve";
+import { useSettingsSelector } from "@/lib/settings";
+import { externalToKitsu, kitsuToImdb, kitsuToTvdb } from "@/lib/providers/anime-mapping";
+import { tmdbLocalizedPoster } from "@/lib/providers/tmdb/tmdb-images";
+import { sizeImageUrl, qualityMultiplier } from "@/lib/img-size";
+import { shouldLocalizePosters } from "@/lib/providers/tmdb/tmdb-image-lang";
+import { useProxiedImageSrc } from "@/lib/remote-image-proxy";
+import { observeResize, observeWithin } from "@/lib/visibility";
+import { ASPECT_PAD, posterTargetWidth, type PosterRatio } from "@/lib/poster-sizing";
+
+type Ratio = PosterRatio;
+
+export function useLocalizedPoster(metaId: string): {
+  url: string | undefined;
+  localizing: boolean;
+} {
+  const settings = useSettingsSelector((s) => ({
+    tmdbKey: s.tmdbKey,
+    tmdbLanguage: s.tmdbLanguage,
+    tmdbImageLangs: s.tmdbImageLangs,
+  }));
+  const isActive = () => {
+    const canResolve = metaId.startsWith("tmdb:") || metaId.startsWith("tt");
+    return !!settings.tmdbKey && canResolve && shouldLocalizePosters();
+  };
+  const [url, setUrl] = useState<string | undefined>(undefined);
+  const [localizing, setLocalizing] = useState<boolean>(isActive);
+  const [seen, setSeen] = useState({
+    metaId,
+    tmdbKey: settings.tmdbKey,
+    tmdbLanguage: settings.tmdbLanguage,
+    tmdbImageLangs: settings.tmdbImageLangs,
+  });
+  if (
+    seen.metaId !== metaId ||
+    seen.tmdbKey !== settings.tmdbKey ||
+    seen.tmdbLanguage !== settings.tmdbLanguage ||
+    seen.tmdbImageLangs !== settings.tmdbImageLangs
+  ) {
+    setSeen({
+      metaId,
+      tmdbKey: settings.tmdbKey,
+      tmdbLanguage: settings.tmdbLanguage,
+      tmdbImageLangs: settings.tmdbImageLangs,
+    });
+    setUrl(undefined);
+    setLocalizing(isActive());
+  }
+  useEffect(() => {
+    const canResolve = metaId.startsWith("tmdb:") || metaId.startsWith("tt");
+    const active = !!settings.tmdbKey && canResolve && shouldLocalizePosters();
+    if (!active) return;
+    let alive = true;
+    void (async () => {
+      const tmdbId = metaId.startsWith("tmdb:")
+        ? metaId
+        : await tmdbIdFromImdb(settings.tmdbKey, metaId);
+      if (!alive) return;
+      if (!tmdbId) {
+        setLocalizing(false);
+        return;
+      }
+      const localized = await tmdbLocalizedPoster(settings.tmdbKey, tmdbId);
+      if (!alive) return;
+      if (localized) setUrl(localized);
+      setLocalizing(false);
+    })();
+    return () => {
+      alive = false;
+    };
+  }, [metaId, settings.tmdbKey, settings.tmdbLanguage, settings.tmdbImageLangs]);
+  return { url, localizing };
+}
+
+export function useRpdbAltId(
+  rpdbKey: string,
+  metaId: string,
+  type?: "movie" | "series",
+): { altId: string | undefined; pending: boolean } {
+  const settings = useSettingsSelector((s) => ({ tmdbKey: s.tmdbKey }));
+  const wantImdb = needsImdbForPoster(rpdbKey, metaId);
+  const wantTmdb = needsTmdbForPoster(rpdbKey, metaId);
+  const imdb = useTmdbImdbId(wantImdb ? metaId : undefined);
+  const tmdb = useTmdbIdFromImdb(wantTmdb ? metaId : undefined);
+  useEffect(() => {
+    if (wantImdb && settings.tmdbKey) void tmdbImdbId(settings.tmdbKey, metaId);
+    if (wantTmdb && settings.tmdbKey) void tmdbIdFromImdb(settings.tmdbKey, metaId, type);
+  }, [wantImdb, wantTmdb, settings.tmdbKey, metaId, type]);
+  const pending =
+    !!settings.tmdbKey && ((wantImdb && imdb === undefined) || (wantTmdb && tmdb === undefined));
+  let altId: string | undefined;
+  if (wantImdb && typeof imdb === "string" && imdb.startsWith("tt")) altId = imdb;
+  else if (wantTmdb && typeof tmdb === "string") altId = tmdb;
+  return { altId, pending };
+}
+
+function useAnimeRpdbIds(
+  rpdbKey: string,
+  metaId: string,
+): { animeImdb?: string; animeTvdb?: string; animeTmdb?: string } {
+  const settings = useSettingsSelector((s) => ({ posterBaseUrl: s.posterBaseUrl }));
+  const [animeImdb, setAnimeImdb] = useState<string>();
+  const [animeTvdb, setAnimeTvdb] = useState<string>();
+  const isAnime = /^(kitsu|mal|anilist|anidb):/.test(metaId);
+  const [idsFor, setIdsFor] = useState(metaId);
+  if (idsFor !== metaId) {
+    setIdsFor(metaId);
+    setAnimeImdb(undefined);
+    setAnimeTvdb(undefined);
+  }
+  useEffect(() => {
+    if (!isAnime || (!rpdbKey && !settings.posterBaseUrl)) return;
+    const m = metaId.match(/^(kitsu|mal|anilist|anidb):(\d+)/);
+    if (!m) return;
+    const source = m[1];
+    const idNum = Number(m[2]);
+    if (!Number.isFinite(idNum)) return;
+    let cancelled = false;
+    (async () => {
+      let kitsuId: number | null = source === "kitsu" ? idNum : null;
+      if (kitsuId == null) {
+        const armSource = source === "mal" ? "myanimelist" : source;
+        kitsuId = await externalToKitsu(armSource, idNum).catch(() => null);
+      }
+      if (cancelled || kitsuId == null) return;
+      const [tt, tv] = await Promise.all([
+        kitsuToImdb(kitsuId).catch(() => null),
+        kitsuToTvdb(kitsuId).catch(() => null),
+      ]);
+      if (cancelled) return;
+      if (tt) setAnimeImdb(tt);
+      if (tv) setAnimeTvdb(String(tv));
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [metaId, isAnime, rpdbKey, settings.posterBaseUrl]);
+  const animeTmdb = useTmdbIdFromImdb(animeImdb) ?? undefined;
+  return { animeImdb, animeTvdb, animeTmdb };
+}
+
+const NO_FAILED_URLS: ReadonlySet<string> = new Set();
+
+export function usePosterChain(
+  rpdbKey: string,
+  metaId: string,
+  metaPoster?: string,
+  type?: "movie" | "series",
+) {
+  const { altId, pending } = useRpdbAltId(rpdbKey, metaId, type);
+  const { animeImdb, animeTvdb, animeTmdb } = useAnimeRpdbIds(rpdbKey, metaId);
+  const { url: localized, localizing } = useLocalizedPoster(metaId);
+  const pinned = useTitlePoster(metaId);
+  const candidates = useMemo(() => {
+    if (pending && !pinned) return [];
+    const base = localized ?? metaPoster;
+    const out: string[] = [];
+    const seen = new Set<string>();
+    // While the localized poster is being resolved, hold the artwork instead of flashing the
+    // original-language (e.g. Japanese) search poster, which then swaps to English once resolved.
+    const fallbacks = localizing
+      ? [pinned]
+      : [
+          animeImdb ? rpdbPoster(rpdbKey, animeImdb, base, animeTmdb) : undefined,
+          animeTvdb ? rpdbPoster(rpdbKey, `tvdb:${animeTvdb}`, base) : undefined,
+          rpdbPoster(rpdbKey, metaId, base, altId),
+          localized,
+          metaPoster,
+        ];
+    for (const u of [pinned, ...fallbacks]) {
+      if (u && !seen.has(u)) {
+        seen.add(u);
+        out.push(u);
+      }
+    }
+    return out;
+  }, [
+    rpdbKey,
+    metaId,
+    altId,
+    metaPoster,
+    animeImdb,
+    animeTvdb,
+    animeTmdb,
+    localized,
+    localizing,
+    pending,
+    pinned,
+  ]);
+  const sig = candidates.join("|");
+  // Failed URLs belong to one candidate list; a new list starts with none failed.
+  const [failed, setFailed] = useState<{ sig: string; urls: ReadonlySet<string> }>(() => ({
+    sig,
+    urls: new Set(),
+  }));
+  const failedUrls = failed.sig === sig ? failed.urls : NO_FAILED_URLS;
+  const src = candidates.find((u) => !failedUrls.has(u));
+  return {
+    src,
+    onError: () => {
+      if (src && !failedUrls.has(src)) {
+        setFailed((prev) => {
+          const urls = prev.sig === sig ? prev.urls : NO_FAILED_URLS;
+          if (urls.has(src)) return prev;
+          return { sig, urls: new Set([...urls, src]) };
+        });
+      }
+    },
+  };
+}
+
+function PosterBody({
+  src,
+  seed,
+  ratio = "portrait",
+  className = "",
+  children,
+  onError,
+  lazy = false,
+  fallbacks,
+}: {
+  src?: string;
+  seed: string;
+  lowResImdb?: string;
+  ratio?: Ratio;
+  className?: string;
+  children?: React.ReactNode;
+  onError?: () => void;
+  lazy?: boolean | "release";
+  fallbacks?: Array<string | null | undefined>;
+}) {
+  const settings = useSettingsSelector((s) => ({
+    posterEffect: s.posterEffect,
+    posterQuality: s.posterQuality,
+  }));
+  const effect = settings.posterEffect;
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  const [inView, setInView] = useState(!lazy);
+  const [eager, setEager] = useState(!lazy);
+  const [targetPx, setTargetPx] = useState(0);
+  const targetPxRef = useRef(0);
+  const qMult = qualityMultiplier(settings.posterQuality);
+  useEffect(() => {
+    if (inView) return;
+    const el = rootRef.current;
+    if (!el) return;
+    return observeWithin(el, "1200px", (e) => {
+      if (!e.isIntersecting) return;
+      const r = e.boundingClientRect;
+      if (r.top < (window.innerHeight || 0) && r.bottom > 0) setEager(true);
+      setInView(true);
+    });
+  }, [inView]);
+  useEffect(() => {
+    if (!lazy || eager || !inView) return;
+    const el = rootRef.current;
+    if (!el) return;
+    return observeWithin(el, "150px", (e) => {
+      if (e.isIntersecting) setEager(true);
+    });
+  }, [lazy, eager, inView]);
+  useEffect(() => {
+    if (!inView || qMult === 0) return;
+    const el = rootRef.current;
+    if (!el) return;
+    return observeResize(el, () => {
+      // getBoundingClientRect sees CSS transforms such as scale(), which clientWidth ignores.
+      const t = posterTargetWidth(
+        el.getBoundingClientRect(),
+        ratio,
+        window.devicePixelRatio,
+        qMult,
+      );
+      if (t <= 0) return;
+      // A page shown again fires this with the same size; skipping the no-op update keeps every poster from re-rendering.
+      if (t <= targetPxRef.current) return;
+      targetPxRef.current = t;
+      setTargetPx(t);
+    });
+  }, [inView, qMult, ratio]);
+  const rawCandidates = [src, ...(fallbacks ?? [])].filter((u): u is string => !!u);
+  const candidates =
+    qMult === 0 || targetPx <= 0
+      ? rawCandidates
+      : rawCandidates.map((u) => sizeImageUrl(u, targetPx));
+  const sig = candidates.join("|");
+  const [idx, setIdx] = useState(0);
+  const [loaded, setLoaded] = useState(false);
+  const [displayed, setDisplayed] = useState<string | undefined>(undefined);
+  const [retry, setRetry] = useState(0);
+  const failedRef = useRef<Set<string>>(new Set());
+  // Render-side copy of failedRef; every failedRef change also sets this.
+  const [failedSet, setFailedSet] = useState<ReadonlySet<string>>(NO_FAILED_URLS);
+  const firedRef = useRef(false);
+  const failBurstRef = useRef<{ t: number; n: number }>({ t: 0, n: 0 });
+  const onErrorRef = useRef(onError);
+  useLayoutEffect(() => {
+    onErrorRef.current = onError;
+  }, [onError]);
+  const [sigSeen, setSigSeen] = useState(sig);
+  if (sigSeen !== sig) {
+    setSigSeen(sig);
+    setIdx(0);
+    setLoaded(false);
+    setRetry(0);
+    setFailedSet(NO_FAILED_URLS);
+  }
+  useEffect(() => {
+    failedRef.current = new Set();
+    firedRef.current = false;
+  }, [sig]);
+
+  useEffect(() => {
+    if (lazy !== "release") return;
+    const el = rootRef.current;
+    if (!el) return;
+    let timer = 0;
+    const stop = observeWithin(el, "2400px", (e) => {
+      if (e.isIntersecting) {
+        if (timer) {
+          window.clearTimeout(timer);
+          timer = 0;
+        }
+        return;
+      }
+      if (timer) return;
+      // A parked page reports every card as off-screen; keep its images so showing it again needs no reload.
+      if (el.closest("[data-layer-inactive]") || !el.getClientRects().length) return;
+      timer = window.setTimeout(() => {
+        timer = 0;
+        if (el.closest("[data-layer-inactive]")) return;
+        if (el.closest("a,button,[tabindex]") === document.activeElement) return;
+        setInView(false);
+        setEager(false);
+        setLoaded(false);
+        setDisplayed(undefined);
+      }, 1500);
+    });
+    return () => {
+      stop();
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [lazy]);
+
+  let cursor = idx;
+  while (cursor < candidates.length && failedSet.has(candidates[cursor])) cursor++;
+  const current: string | undefined = candidates[cursor];
+  const exhausted = cursor >= candidates.length;
+  // Remote plain-HTTP images (e.g. a Suwayomi server on a VPS) are mixed-content
+  // blocked by the WebView; resolve them to a same-origin blob URL.
+  const currentSrc = useProxiedImageSrc(current);
+  const displayedSrc = useProxiedImageSrc(displayed);
+
+  useEffect(() => {
+    if (exhausted && !firedRef.current) {
+      firedRef.current = true;
+      onErrorRef.current?.();
+    }
+  }, [exhausted]);
+
+  useEffect(() => {
+    if (!exhausted) return;
+    const retryNow = () => {
+      failedRef.current = new Set();
+      setFailedSet(NO_FAILED_URLS);
+      firedRef.current = false;
+      setIdx(0);
+      setRetry((r) => r + 1);
+    };
+    window.addEventListener("online", retryNow);
+    const timer = retry < 4 ? window.setTimeout(retryNow, 1200 * 2 ** retry) : undefined;
+    return () => {
+      window.removeEventListener("online", retryNow);
+      if (timer) window.clearTimeout(timer);
+    };
+  }, [exhausted, retry]);
+
+  const fail = useCallback(
+    (url: string) => {
+      const now = Date.now();
+      const b = failBurstRef.current;
+      if (now - b.t > 1000) {
+        b.t = now;
+        b.n = 0;
+      }
+      if (++b.n > 24) return;
+      if (failedRef.current.has(url)) return;
+      failedRef.current.add(url);
+      setFailedSet(new Set(failedRef.current));
+      setLoaded(false);
+      setIdx((i) => i + 1);
+    },
+    [setFailedSet, setLoaded, setIdx],
+  );
+  const currentRef = useRef(current);
+  useLayoutEffect(() => {
+    currentRef.current = current;
+  }, [current]);
+  const imgElRef = useRef<HTMLImageElement | null>(null);
+  // Ref callbacks run before this component's layout effects, so the attach reads `current` directly.
+  const handleImgRef = useCallback(
+    (el: HTMLImageElement | null) => {
+      imgElRef.current = el;
+      if (!el) return;
+      if (el.complete) {
+        if (el.naturalWidth > 0) {
+          setLoaded(true);
+          setDisplayed(current);
+        } else if (current) fail(current);
+        return;
+      }
+      const target = current;
+      el.decode().then(
+        () => {
+          if (imgElRef.current === el && currentRef.current === target && target) {
+            setLoaded(true);
+            setDisplayed(target);
+          }
+        },
+        () => {},
+      );
+    },
+    [fail, current, setLoaded, setDisplayed],
+  );
+  useEffect(() => {
+    if (loaded || !current) return;
+    const el = imgElRef.current;
+    if (el && el.complete && el.naturalWidth > 0) {
+      setLoaded(true);
+      setDisplayed(current);
+    }
+  }, [loaded, current, sig]);
+  const showShimmer = !displayed && !loaded && !exhausted;
+  const showPlate = !displayed && exhausted;
+  const hasBase = !!displayed && displayed !== current;
+  const hue = hash(seed) % 360;
+
+  return (
+    <div
+      ref={rootRef}
+      className={`harbor-poster your-card relative w-full overflow-hidden rounded-[var(--poster-radius,12px)] ${className}`}
+      style={showPlate ? { background: gradient(hue) } : undefined}
+    >
+      <div aria-hidden style={{ paddingTop: ASPECT_PAD[ratio] }} />
+      {showShimmer && (
+        <span
+          aria-hidden
+          className="harbor-shimmer absolute inset-0"
+          data-idle={inView ? undefined : ""}
+        />
+      )}
+      {displayed && displayed !== current && displayedSrc && (
+        <img
+          src={displayedSrc}
+          alt=""
+          aria-hidden
+          draggable={false}
+          decoding="async"
+          className="absolute inset-0 h-full w-full object-cover"
+        />
+      )}
+      {current && currentSrc && inView && (qMult === 0 || targetPx > 0) && (
+        <img
+          key={current}
+          ref={handleImgRef}
+          src={currentSrc}
+          alt=""
+          draggable={false}
+          decoding="async"
+          fetchPriority={eager ? "high" : undefined}
+          onLoad={() => {
+            setLoaded(true);
+            setDisplayed(current);
+          }}
+          onError={() => fail(current)}
+          className="absolute inset-0 h-full w-full object-cover"
+          style={
+            effect === "off"
+              ? { opacity: 1 }
+              : {
+                  opacity: loaded ? 1 : 0,
+                  transition: hasBase ? "opacity 300ms ease-out" : undefined,
+                }
+          }
+        />
+      )}
+      {children}
+    </div>
+  );
+}
+
+// Every arrow press on the Big Picture taste grid re-ran 40 Poster bodies for
+// props whose values had not changed, and a MutationObserver recorded no DOM
+// change from any of them. Call sites that pass children or onError inline will
+// still re-render; those are fresh objects every time by construction.
+export const Poster = memo(PosterBody);
+
+export function posterPlate(seed: string): string {
+  return gradient(hash(seed) % 360);
+}
+
+function gradient(hue: number) {
+  const a = hue;
+  const b = (hue + 140) % 360;
+  const c = (hue + 60) % 360;
+  return `
+    radial-gradient(ellipse at 25% 30%, oklch(0.45 0.14 ${a}) 0%, transparent 55%),
+    radial-gradient(ellipse at 75% 75%, oklch(0.32 0.10 ${b}) 0%, transparent 55%),
+    linear-gradient(135deg, oklch(0.20 0.05 ${c}), oklch(0.10 0.02 ${b}))
+  `;
+}
+
+function hash(s: string) {
+  const str = typeof s === "string" ? s : "";
+  let h = 0;
+  for (let i = 0; i < str.length; i++) h = (h << 5) - h + str.charCodeAt(i);
+  return Math.abs(h);
+}

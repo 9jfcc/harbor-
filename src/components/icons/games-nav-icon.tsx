@@ -1,0 +1,36 @@
+import { useState } from "react";
+import { useSettingsSelector } from "@/lib/settings";
+import { useReducedMotion } from "@/lib/use-reduced-motion";
+import { GamesIcon } from "./games-icon";
+import "./games-nav-icon.css";
+
+export function GamesNavIcon({ hovered = false }: { hovered?: boolean }) {
+  const settings = useSettingsSelector((s) => ({ navIconAnimations: s.navIconAnimations }));
+  const reducedMotion = useReducedMotion();
+  const enabled = settings.navIconAnimations && !reducedMotion;
+  const [pressing, setPressing] = useState(enabled && hovered);
+  const [seen, setSeen] = useState({ enabled, hovered });
+  if (seen.enabled !== enabled || seen.hovered !== hovered) {
+    setSeen({ enabled, hovered });
+    if (!enabled) setPressing(false);
+    else if (hovered) setPressing(true);
+    // Finish the release when the pointer leaves, like the Sports icon's landing.
+  }
+
+  return (
+    <span
+      aria-hidden="true"
+      className={`games-nav-icon${enabled && pressing ? " is-pressing" : ""}`}
+      onAnimationEnd={(event) => {
+        if (
+          event.animationName === "games-nav-play" &&
+          event.target === event.currentTarget.querySelector("svg")
+        ) {
+          setPressing(false);
+        }
+      }}
+    >
+      <GamesIcon />
+    </span>
+  );
+}
